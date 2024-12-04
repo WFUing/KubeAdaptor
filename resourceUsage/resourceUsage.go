@@ -15,27 +15,33 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
 
 type resourceRequest struct {
-	MilliCpu uint64
-	Memory uint64
+	MilliCpu         uint64
+	Memory           uint64
 	EphemeralStorage uint64
+	GPU              uint64 // Added GPU resource request
 }
+
 type NodeResidualResource struct {
 	MilliCpu uint64
-	Memory uint64
+	Memory   uint64
+	GPU      uint64 // Added GPU residual resource
 }
+
 type NodeAllocateResource struct {
 	MilliCpu uint64
-	Memory uint64
+	Memory   uint64
+	GPU      uint64 // Added GPU allocated resource
 }
+
 type NodeUsedResource struct {
 	MilliCpu uint64
-	Memory uint64
+	Memory   uint64
+	GPU      uint64 // Added GPU used resource
 }
 
 type ResidualResourceMap map[string]NodeResidualResource
@@ -53,6 +59,8 @@ var clientset *kubernetes.Clientset
 
 var clusterAllocatedCpu uint64
 var clusterAllocatedMemory uint64
+var clusterAllocatedGPU uint64 // Initialize GPU resources
+var clusterUsedGPU uint64
 var clusterUsedCpu uint64
 var clusterUsedMemory uint64
 var masterIp string
@@ -63,11 +71,11 @@ func GetRemoteK8sClient() *kubernetes.Clientset {
 	//k8sconfig= flag.String("k8sconfig","/opt/kubernetes/cfg/kubelet.kubeconfig","kubernetes config file path")
 	//flag.Parse()
 	//var k8sconfig string
-	k8sconfig, err  := filepath.Abs(filepath.Dir("/etc/kubernetes/kubelet.kubeconfig"))
+	k8sconfig, err := filepath.Abs(filepath.Dir("/etc/kubernetes/kubelet.kubeconfig"))
 	if err != nil {
 		panic(err.Error())
 	}
-	config, err := clientcmd.BuildConfigFromFlags("",k8sconfig+ "/kubelet.kubeconfig")
+	config, err := clientcmd.BuildConfigFromFlags("", k8sconfig+"/kubelet.kubeconfig")
 	if err != nil {
 		log.Println(err)
 	}
@@ -92,11 +100,11 @@ func GetInformerK8sClient(configfile string) *kubernetes.Clientset {
 	//if configfile == "/kubelet.kubeconfig" {
 	//k8sconfig, err  := filepath.Abs(filepath.Dir("/opt/kubernetes/cfg/kubelet.kubeconfig"))
 
-	k8sconfig, err  := filepath.Abs(filepath.Dir("/etc/kubernetes/kubelet.kubeconfig"))
+	k8sconfig, err := filepath.Abs(filepath.Dir("/etc/kubernetes/kubelet.kubeconfig"))
 	if err != nil {
 		panic(err.Error())
 	}
-	config, err := clientcmd.BuildConfigFromFlags("",k8sconfig + configfile)
+	config, err := clientcmd.BuildConfigFromFlags("", k8sconfig+configfile)
 	if err != nil {
 		log.Println(err)
 	}
@@ -110,8 +118,7 @@ func GetInformerK8sClient(configfile string) *kubernetes.Clientset {
 	return clientset
 }
 
-
-func InitInformer(stop chan struct{}, configfile string) (v1.PodLister,v1.NodeLister,v1.NamespaceLister){
+func InitInformer(stop chan struct{}, configfile string) (v1.PodLister, v1.NodeLister, v1.NamespaceLister) {
 
 	//Connect apiserver of K8s and create clientset
 	informerClientset := GetInformerK8sClient(configfile)
@@ -211,47 +218,54 @@ func onNamespaceUpdate(old interface{}, current interface{}) {
 func onNamespaceDelete(obj interface{}) {
 }
 
-//Traverse all hte pods of Nodes in K8s Cluster and obtain the account of request of all pods
-func getEachNodePodsResourceRequest(pods []*corev1.Pod,nodeName string) resourceRequest {
-	resourceRequestNum = resourceRequest{0, 0, 0}
+func getEachNodePodsResourceRequest(pods []*corev1.Pod, nodeName string) resourceRequest {
+	resourceRequestNum = resourceRequest{0, 0, 0, 0} // Initialize GPU to 0
 	for _, pod := range pods {
 		if pod.Status.HostIP == nodeName {
-			if (pod.Status.Phase == "Running")||(pod.Status.Phase == "Pending"){
+			if (pod.Status.Phase == "Running") || (pod.Status.Phase == "Pending") {
 				for _, container := range pod.Spec.Containers {
 					resourceRequestNum.MilliCpu += uint64(container.Resources.Requests.Cpu().MilliValue())
 					resourceRequestNum.Memory += uint64(container.Resources.Requests.Memory().Value())
 					resourceRequestNum.EphemeralStorage += uint64(container.Resources.Requests.StorageEphemeral().Value())
+					// Add GPU resource request
+					if gpu, exists := container.Resources.Requests["nvidia.com/gpu"]; exists {
+						resourceRequestNum.GPU += uint64(gpu.Value())
+					}
 				}
 				for _, initContainer := range pod.Spec.InitContainers {
 					resourceRequestNum.MilliCpu += uint64(initContainer.Resources.Requests.Cpu().MilliValue())
 					resourceRequestNum.Memory += uint64(initContainer.Resources.Requests.Memory().Value())
+					// Add GPU resource request for initContainers
+					if gpu, exists := initContainer.Resources.Requests["nvidia.com/gpu"]; exists {
+						resourceRequestNum.GPU += uint64(gpu.Value())
+					}
 				}
-				//fmt.Printf("cpu = %d\n",resourceRequestNum.MilliCpu)
-				//fmt.Printf("mem = %d\n",resourceRequestNum.Memory/1024/1024)
 			}
 		}
-		//log.Printf("This %s's HostIP is %s .\n",pod.Name,pod.Status.HostIP)
 	}
 	return resourceRequestNum
 }
-// obtain the account of allocatable of all nodes in cluster
-func getEachNodeAllocatableNum( nodes []*corev1.Node, nodeName string) resourceRequest {
-	resourceAllocatableNum = resourceRequest{0,0,0}
-	for _, nod := range nodes {
-		if nod.Name == nodeName {
-			//if nod.Name == "k8s4-node1" && nodeName == "192.168.6.110" {
-			resourceAllocatableNum.MilliCpu = uint64(nod.Status.Allocatable.Cpu().MilliValue())
-			resourceAllocatableNum.Memory = uint64(nod.Status.Allocatable.Memory().Value())
-			resourceAllocatableNum.EphemeralStorage = uint64(nod.Status.Allocatable.StorageEphemeral().Value())
 
+// obtain the account of allocatable of all nodes in cluster
+func getEachNodeAllocatableNum(nodes []*corev1.Node, nodeName string) resourceRequest {
+	resourceAllocatableNum = resourceRequest{0, 0, 0, 0} // Initialize GPU to 0
+	for _, node := range nodes {
+		if node.Name == nodeName {
+			resourceAllocatableNum.MilliCpu = uint64(node.Status.Allocatable.Cpu().MilliValue())
+			resourceAllocatableNum.Memory = uint64(node.Status.Allocatable.Memory().Value())
+			resourceAllocatableNum.EphemeralStorage = uint64(node.Status.Allocatable.StorageEphemeral().Value())
+			// Add GPU allocation
+			if gpu, exists := node.Status.Allocatable["nvidia.com/gpu"]; exists {
+				resourceAllocatableNum.GPU = uint64(gpu.Value())
+			}
 		}
 	}
 	return resourceAllocatableNum
 }
 
-func GetEachNodeResource(podLister v1.PodLister,nodeLister v1.NodeLister,
+func GetEachNodeResource(podLister v1.PodLister, nodeLister v1.NodeLister,
 	NodeUsedResourceMap NodeUsedResourceMap,
-	NodeAllocateResourceMap NodeAllocateResourceMap)(NodeUsedResourceMap,NodeAllocateResourceMap) {
+	NodeAllocateResourceMap NodeAllocateResourceMap) (NodeUsedResourceMap, NodeAllocateResourceMap) {
 
 	podList, err := podLister.List(labels.Everything())
 	if err != nil {
@@ -266,9 +280,9 @@ func GetEachNodeResource(podLister v1.PodLister,nodeLister v1.NodeLister,
 
 	for key, val := range NodeUsedResourceMap {
 		currentNodePodsResourceSum := getEachNodePodsResourceRequest(podList, key)
-		val.MilliCpu =  currentNodePodsResourceSum.MilliCpu
+		val.MilliCpu = currentNodePodsResourceSum.MilliCpu
 		val.Memory = currentNodePodsResourceSum.Memory
-		NodeUsedResourceMap[key] = NodeUsedResource{val.MilliCpu, val.Memory/1024/1024}
+		NodeUsedResourceMap[key] = NodeUsedResource{val.MilliCpu, val.Memory / 1024 / 1024, val.GPU}
 		//log.Println(NodeUsedResourceMap)
 	}
 
@@ -276,7 +290,7 @@ func GetEachNodeResource(podLister v1.PodLister,nodeLister v1.NodeLister,
 		currentNodeAllocatableResource := getEachNodeAllocatableNum(nodeList, key)
 		val1.MilliCpu = currentNodeAllocatableResource.MilliCpu
 		val1.Memory = currentNodeAllocatableResource.Memory
-		NodeAllocateResourceMap[key] = NodeAllocateResource{val1.MilliCpu, val1.Memory/1024/1024}
+		NodeAllocateResourceMap[key] = NodeAllocateResource{val1.MilliCpu, val1.Memory / 1024 / 1024, val1.GPU}
 		//log.Println(NodeAllocateResourceMap)
 	}
 	//log.Println(NodeUsedResourceMap)
@@ -284,133 +298,102 @@ func GetEachNodeResource(podLister v1.PodLister,nodeLister v1.NodeLister,
 	return NodeUsedResourceMap, NodeAllocateResourceMap
 }
 
+// Initialize nodeAllocateResourceMap
+func initNodeAllocateResourceMap(resourceMap NodeAllocateResourceMap) NodeAllocateResourceMap {
 
-//Initialize nodeAllocateResourceMap
-func initNodeAllocateResourceMap(resourceMap NodeAllocateResourceMap, clusterMasterIp string) NodeAllocateResourceMap {
-	splitName :=  strings.Split(clusterMasterIp,".")
-	nodeIpFourthField, err := strconv.Atoi(splitName[len(splitName)-1])
+	nodeList, err := nodeLister.List(labels.Everything())
 	if err != nil {
 		panic(err)
 	}
-	nodeNum, err := strconv.Atoi(os.Getenv("NODE_NUM"))
-	if err != nil {
-		panic(err)
-	}
-	nodeIpThirdField, err := strconv.Atoi(splitName[2])
-	if err != nil {
-		panic(err)
-	}
-	nodeIpPrefix := splitName[0] + "." +splitName[1] + "." + splitName[2] + "."
 
-	for i := 1; i <= nodeNum; i++ {
-		if (nodeIpFourthField+i) < 256 {
-			nodeAllocatedResourceKey := nodeIpPrefix + strconv.Itoa( nodeIpFourthField+i )
-			resourceMap[nodeAllocatedResourceKey] = NodeAllocateResource{0, 0}
-		}else {
-			nodeIpFourthField = nodeIpFourthField + i - 256
-			nodeIpThirdField = nodeIpThirdField + 1
-			nodeIpPrefix = splitName[0] + "." +splitName[1] + "." + strconv.Itoa(nodeIpThirdField) + "."
-			nodeAllocatedResourceKey := nodeIpPrefix + strconv.Itoa(nodeIpFourthField+i)
-			resourceMap[nodeAllocatedResourceKey] = NodeAllocateResource{0, 0}
-		}
+	for _, node := range nodeList {
+		nodeIP := node.Status.Addresses[0].Address
+		resourceMap[nodeIP] = NodeAllocateResource{0, 0, 0} // Initialize GPU to 0
 	}
-	log.Println(resourceMap)
-	return resourceMap
-}
-//Initialize nodeUsedResourceMap
-func initNodeUsedResourceMap(resourceMap NodeUsedResourceMap, clusterMasterIp string) NodeUsedResourceMap {
 
-	//nodeIpPrefix := "192.168.6."
-	splitName :=  strings.Split(clusterMasterIp,".")
-	nodeIpFourthField, err := strconv.Atoi(splitName[len(splitName)-1])
-	if err != nil {
-		panic(err)
-	}
-	nodeNum, err := strconv.Atoi(os.Getenv("NODE_NUM"))
-	if err != nil {
-		panic(err)
-	}
-	nodeIpThirdField, err := strconv.Atoi(splitName[2])
-	if err != nil {
-		panic(err)
-	}
-	nodeIpPrefix := splitName[0] + "." +splitName[1] + "." + splitName[2] + "."
-
-	for i := 1; i <= nodeNum; i++ {
-		if (nodeIpFourthField+i) < 256 {
-			nodeUsedResourceKey := nodeIpPrefix + strconv.Itoa( nodeIpFourthField+i )
-			resourceMap[nodeUsedResourceKey] = NodeUsedResource{0, 0}
-		}else {
-			nodeIpFourthField = nodeIpFourthField + i - 256
-			nodeIpThirdField = nodeIpThirdField + 1
-			nodeIpPrefix = splitName[0] + "." +splitName[1] + "." + strconv.Itoa(nodeIpThirdField) + "."
-			nodeUsedResourceKey := nodeIpPrefix + strconv.Itoa(nodeIpFourthField+i)
-			resourceMap[nodeUsedResourceKey] = NodeUsedResource{0, 0}
-		}
-	}
 	log.Println(resourceMap)
 	return resourceMap
 }
 
-func gatherResource(waiter *sync.WaitGroup,allocateResourceMap NodeAllocateResourceMap,
+// Initialize nodeUsedResourceMap
+func initNodeUsedResourceMap(resourceMap NodeUsedResourceMap) NodeUsedResourceMap {
+
+	nodeList, err := nodeLister.List(labels.Everything())
+	if err != nil {
+		panic(err)
+	}
+
+	for _, node := range nodeList {
+		nodeIP := node.Status.Addresses[0].Address
+		resourceMap[nodeIP] = NodeUsedResource{0, 0, 0} // Initialize GPU to 0
+	}
+
+	log.Println(resourceMap)
+	return resourceMap
+}
+
+func gatherResource(waiter *sync.WaitGroup, allocateResourceMap NodeAllocateResourceMap,
 	usedResourceMap NodeUsedResourceMap, interTimeVal uint32) {
 	defer waiter.Done()
 
-	limit := make(chan string,1)
-	for{
+	limit := make(chan string, 1)
+	for {
 		clusterAllocatedCpu = 0
 		clusterAllocatedMemory = 0
 		clusterUsedCpu = 0
 		clusterUsedMemory = 0
+		clusterAllocatedGPU = 0 // Initialize GPU resources
+		clusterUsedGPU = 0      // Initialize GPU resources
 		limit <- "s"
 		time.AfterFunc(time.Duration(interTimeVal)*time.Millisecond, func() {
 			//Obtain resource map of Allocatable and Used for each node
 			nodeUsedMap, nodeAllocateMap := GetEachNodeResource(podLister, nodeLister,
-				usedResourceMap,allocateResourceMap)
-			//Traverse nodeAllocateMap
-			for _, allocatedVal := range nodeAllocateMap{
+				usedResourceMap, allocateResourceMap)
+			// Traverse nodeAllocateMap
+			for _, allocatedVal := range nodeAllocateMap {
 				clusterAllocatedCpu += allocatedVal.MilliCpu
 				clusterAllocatedMemory += allocatedVal.Memory
+				clusterAllocatedGPU += allocatedVal.GPU // Add GPU allocation
 			}
-			for _, usedVal := range nodeUsedMap{
+			for _, usedVal := range nodeUsedMap {
 				clusterUsedCpu += usedVal.MilliCpu
 				clusterUsedMemory += usedVal.Memory
+				clusterUsedGPU += usedVal.GPU // Add GPU usage
 			}
 			log.Println("****************************************************")
-			log.Printf("Current time:%v\n",time.Now().UnixNano()/1e6)
-			log.Printf("clusterAllocatedCpu = %d, clusterUsedCpu = %d\n",clusterAllocatedCpu,clusterUsedCpu)
-			log.Printf("clusterAllocatedMem = %d, clusterUsedMem = %d\n",clusterAllocatedMemory,clusterUsedMemory)
+			log.Printf("Current time:%v\n", time.Now().UnixNano()/1e6)
+			log.Printf("clusterAllocatedCpu = %d, clusterUsedCpu = %d\n", clusterAllocatedCpu, clusterUsedCpu)
+			log.Printf("clusterAllocatedMem = %d, clusterUsedMem = %d\n", clusterAllocatedMemory, clusterUsedMemory)
+			log.Printf("clusterAllocatedGPU = %d, clusterUsedGPU = %d\n", clusterAllocatedGPU, clusterUsedGPU)
 			log.Println("****************************************************")
-			<- limit
+			<-limit
 		})
 	}
 }
 
 func main() {
 	//Store log
-	logFile, err := os.OpenFile("/home/usage.txt", os.O_CREATE | os.O_APPEND | os.O_RDWR, 0666)
+	logFile, err := os.OpenFile("/tmp/usage.txt", os.O_CREATE|os.O_APPEND|os.O_RDWR, 0666)
 	if err != nil {
 		panic(err)
 	}
 	defer logFile.Close()
-	mw := io.MultiWriter(os.Stdout,logFile)
+	mw := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(mw)
 	//Get MasterIp by env
 	masterIp = os.Getenv("MASTER_IP")
-	log.Printf("masterIp: %v\n",masterIp)
+	log.Printf("masterIp: %v\n", masterIp)
 	//Get time interval of sample by env
 	gatherTime = os.Getenv("GATHER_TIME")
-	log.Printf("gatherTime: %v\n",gatherTime)
+	log.Printf("gatherTime: %v\n", gatherTime)
 	valTime, err := strconv.Atoi(gatherTime)
 	if err != nil {
 		panic(err)
 	}
 	interval = uint32(valTime)
 
-	nodeAllocateResourceMap := make(NodeAllocateResourceMap)
-	nodeUsedResourceMap := make(NodeUsedResourceMap)
-	allocateResourceMap := initNodeAllocateResourceMap(nodeAllocateResourceMap, masterIp)
-	usedResourceMap := initNodeUsedResourceMap(nodeUsedResourceMap, masterIp)
+	//Create K8s's client
+	clientset = GetRemoteK8sClient()
 
 	//Create chan for informer
 	stopper := make(chan struct{})
@@ -418,13 +401,16 @@ func main() {
 	waiter := sync.WaitGroup{}
 	waiter.Add(1)
 
-	//Create K8s's client
-	clientset = GetRemoteK8sClient()
 	//Create Informer
-	podLister, nodeLister, namespaceLister = InitInformer(stopper,"/kubelet.kubeconfig")
+	podLister, nodeLister, namespaceLister = InitInformer(stopper, "/kubelet.kubeconfig")
+
+	nodeAllocateResourceMap := make(NodeAllocateResourceMap)
+	nodeUsedResourceMap := make(NodeUsedResourceMap)
+	allocateResourceMap := initNodeAllocateResourceMap(nodeAllocateResourceMap)
+	usedResourceMap := initNodeUsedResourceMap(nodeUsedResourceMap)
 
 	//Gather resource periodically
-	go gatherResource(&waiter,allocateResourceMap,usedResourceMap,interval)
+	go gatherResource(&waiter, allocateResourceMap, usedResourceMap, interval)
 
 	defer runtime.HandleCrash()
 
